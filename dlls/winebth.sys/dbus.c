@@ -2944,8 +2944,20 @@ static DBusHandlerResult bluez_filter( DBusConnection *conn, DBusMessage *msg, v
 
     type = p_dbus_message_get_type( msg );
     if (type == DBUS_MESSAGE_TYPE_SIGNAL)
+    {
+        const char *sender = p_dbus_message_get_sender( msg );
+
+        /* The match rules only select what is broadcast. Any client of the bus can also address a signal to this
+         * connection, so only take them from BlueZ and from the bus itself. */
+        if (!sender || (strcmp( sender, DBUS_INTERFACE_DBUS ) &&
+                        (!ctx->bluez_dbus_unique_name || strcmp( sender, ctx->bluez_dbus_unique_name ))))
+        {
+            if (sender) WARN_(dbus)( "Ignoring signal from unknown sender: %s\n", debugstr_a( sender ) );
+            return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+        }
         bluez_signal_handler( conn, msg, p_dbus_message_get_interface( msg ), p_dbus_message_get_member( msg ),
                               p_dbus_message_get_signature( msg ), ctx );
+    }
     else if (type == DBUS_MESSAGE_TYPE_METHOD_CALL)
     {
         DBusMessage *reply;
