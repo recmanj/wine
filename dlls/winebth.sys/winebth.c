@@ -261,12 +261,12 @@ static NTSTATUS bluetooth_gatt_service_get_characteristics( struct bluetooth_gat
     ULONG outsize = stack->Parameters.DeviceIoControl.OutputBufferLength;
     struct bluetooth_gatt_characteristic *chrc;
     NTSTATUS status;
-    SIZE_T rem;
+    SIZE_T rem, capacity;
 
     if (outsize < min_size)
         return STATUS_INVALID_USER_BUFFER;
 
-    rem = (outsize - min_size)/sizeof( *chars->characteristics );
+    rem = capacity = (outsize - min_size)/sizeof( *chars->characteristics );
     status = STATUS_SUCCESS;
     chars->count = 0;
 
@@ -282,7 +282,9 @@ static NTSTATUS bluetooth_gatt_service_get_characteristics( struct bluetooth_gat
     }
     LeaveCriticalSection( &service->chars_cs );
 
-    irp->IoStatus.Information = offsetof( struct winebth_le_device_get_gatt_characteristics_params, characteristics[chars->count] );
+    /* count tells the caller how many there are, but only the ones that fit were written. */
+    irp->IoStatus.Information = offsetof( struct winebth_le_device_get_gatt_characteristics_params,
+                                          characteristics[min( chars->count, capacity )] );
     if (chars->count > rem)
         status = STATUS_MORE_ENTRIES;
     return status;
@@ -482,7 +484,8 @@ static NTSTATUS bluetooth_device_fill_gatt_services( struct bluetooth_remote_dev
             info->AttributeHandle = svc->handle;
         }
     }
-    irp->IoStatus.Information = offsetof( struct winebth_le_device_get_gatt_services_params, services[services->count] );
+    irp->IoStatus.Information = offsetof( struct winebth_le_device_get_gatt_services_params,
+                                          services[min( services->count, capacity )] );
     if (services->count > capacity)
         status = STATUS_MORE_ENTRIES;
     return status;
