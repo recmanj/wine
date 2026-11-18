@@ -673,6 +673,7 @@ struct bluetooth_auth_listener
     PFN_AUTHENTICATION_CALLBACK_EX callback;
 
     void *user_data;
+    BOOL free_after_callback; /* unregistered from its own callback */
 };
 
 struct bluetooth_auth_wizard_listener
@@ -703,17 +704,40 @@ static struct list bluetooth_auth_listeners = LIST_INIT( bluetooth_auth_listener
 static struct list bluetooth_auth_wizard_listeners = LIST_INIT( bluetooth_auth_wizard_listeners );
 static HCMNOTIFICATION bluetooth_auth_event_notify; /* Guarded by bluetooth_auth_lock */
 
+/* Callbacks that are queued or running. Guarded by bluetooth_auth_lock. */
+static struct list bluetooth_auth_callbacks = LIST_INIT( bluetooth_auth_callbacks );
+static CONDITION_VARIABLE bluetooth_auth_callback_done = CONDITION_VARIABLE_INIT;
+
 struct auth_callback_data
 {
-    PFN_AUTHENTICATION_CALLBACK_EX callback;
+    struct list entry;
+    struct bluetooth_auth_listener *listener; /* NULL once the listener is unregistered */
     struct winebth_authentication_request request;
-    void *user_data;
+    DWORD thread; /* thread running the callback, 0 while it is queued */
 };
+
+/* Whether threads other than the calling one are running callbacks of a listener. */
+static BOOL bluetooth_auth_listener_busy( const struct bluetooth_auth_listener *listener, BOOL *in_callback )
+{
+    struct auth_callback_data *data;
+    BOOL busy = FALSE;
+
+    *in_callback = FALSE;
+    LIST_FOR_EACH_ENTRY( data, &bluetooth_auth_callbacks, struct auth_callback_data, entry )
+    {
+        if (data->listener != listener) continue;
+        if (data->thread == GetCurrentThreadId()) *in_callback = TRUE;
+        else busy = TRUE;
+    }
+    return busy;
+}
 
 static CALLBACK void tp_auth_callback_proc( TP_CALLBACK_INSTANCE *instance, void *ctx )
 {
     BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS params;
     struct auth_callback_data *data = ctx;
+    struct bluetooth_auth_listener *listener;
+    BOOL in_callback;
 
     device_info_from_bth_info( &params.deviceInfo, &data->request.device_info );
     /* For some reason, Windows uses the *local* time here. */
@@ -723,7 +747,20 @@ static CALLBACK void tp_auth_callback_proc( TP_CALLBACK_INSTANCE *instance, void
     params.ioCapability = BLUETOOTH_IO_CAPABILITY_UNDEFINED;
     params.authenticationRequirements = BLUETOOTH_MITM_ProtectionNotDefined;
     params.Numeric_Value = data->request.numeric_value_or_passkey;
-    data->callback( data->user_data, &params );
+
+    AcquireSRWLockExclusive( &bluetooth_auth_lock );
+    if ((listener = data->listener)) data->thread = GetCurrentThreadId();
+    ReleaseSRWLockExclusive( &bluetooth_auth_lock );
+
+    if (listener) listener->callback( listener->user_data, &params );
+
+    AcquireSRWLockExclusive( &bluetooth_auth_lock );
+    list_remove( &data->entry );
+    if (listener && listener->free_after_callback &&
+        !bluetooth_auth_listener_busy( listener, &in_callback ) && !in_callback)
+        free( listener );
+    ReleaseSRWLockExclusive( &bluetooth_auth_lock );
+    WakeAllConditionVariable( &bluetooth_auth_callback_done );
     free( data );
 }
 
@@ -850,11 +887,12 @@ static CALLBACK DWORD bluetooth_auth_event_callback( HCMNOTIFICATION notify, voi
                 continue;
 
             data->request = *request;
-            data->callback = listener->callback;
-            data->user_data = listener->user_data;
+            data->listener = listener;
+            list_add_tail( &bluetooth_auth_callbacks, &data->entry );
             if (!TrySubmitThreadpoolCallback( tp_auth_callback_proc, data, NULL ))
             {
                 ERR( "TrySubmitThreadpoolCallback failed: %lu\n", GetLastError() );
+                list_remove( &data->entry );
                 free( data );
                 continue;
             }
@@ -972,8 +1010,10 @@ DWORD WINAPI BluetoothRegisterForAuthenticationEx( const BLUETOOTH_DEVICE_INFO *
 BOOL WINAPI BluetoothUnregisterAuthentication( HBLUETOOTH_AUTHENTICATION_REGISTRATION handle )
 {
     struct bluetooth_auth_listener *listener = handle;
+    struct auth_callback_data *data;
     HCMNOTIFICATION notify = NULL;
     DWORD ret = ERROR_SUCCESS;
+    BOOL in_callback;
 
     TRACE( "(%s)\n", debugstr_bluetooth_auth_listener( handle ) );
 
@@ -990,6 +1030,14 @@ BOOL WINAPI BluetoothUnregisterAuthentication( HBLUETOOTH_AUTHENTICATION_REGISTR
         notify = bluetooth_auth_event_notify;
         bluetooth_auth_event_notify = NULL;
     }
+    /* The caller may free the callback's context once this returns. A queued callback is not called anymore,
+     * one that is running has to return first. */
+    LIST_FOR_EACH_ENTRY( data, &bluetooth_auth_callbacks, struct auth_callback_data, entry )
+        if (data->listener == listener && !data->thread) data->listener = NULL;
+    while (bluetooth_auth_listener_busy( listener, &in_callback ))
+        SleepConditionVariableSRW( &bluetooth_auth_callback_done, &bluetooth_auth_lock, INFINITE, 0 );
+    if (in_callback) listener->free_after_callback = TRUE;
+    else free( listener );
     ReleaseSRWLockExclusive( &bluetooth_auth_lock );
 
     /* The callback takes bluetooth_auth_lock, so this cannot be done while holding it. */
