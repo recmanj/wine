@@ -378,7 +378,7 @@ static NTSTATUS bluetooth_gatt_service_dispatch( DEVICE_OBJECT *device, struct b
         struct bluetooth_gatt_characteristic *chrc;
 
         if (!params || insize < sizeof( *params ) ||
-            insize < offsetof( struct winebth_gatt_service_write_characteristic_value_params, buf[params->size] ))
+            params->size > insize - offsetof( struct winebth_gatt_service_write_characteristic_value_params, buf ))
         {
             status = STATUS_INVALID_USER_BUFFER;
             break;
