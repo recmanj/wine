@@ -260,9 +260,12 @@ static DWORD CALLBACK ble_device_notify_callback( HCMNOTIFICATION notify, void *
     in_range = (const BTH_RADIO_IN_RANGE *)event_data->u.DeviceHandle.Data;
     if (in_range->deviceInfo.address != impl->addr) return ERROR_SUCCESS;
     if (!((in_range->deviceInfo.flags ^ in_range->previousDeviceFlags) & BDIF_CONNECTED)) return ERROR_SUCCESS;
+    /* A handler may release the device. */
+    if (!addref_unless_zero( &impl->ref )) return ERROR_SUCCESS;
 
     TRACE( "device %p connected %d\n", impl, !!(in_range->deviceInfo.flags & BDIF_CONNECTED) );
     ble_device_dispatch_status_changed( impl );
+    IBluetoothLEDevice_Release( &impl->IBluetoothLEDevice_iface );
     return ERROR_SUCCESS;
 }
 

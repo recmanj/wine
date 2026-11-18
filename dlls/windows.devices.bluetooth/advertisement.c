@@ -1717,6 +1717,7 @@ static DWORD CALLBACK adv_watcher_notify_callback( HCMNOTIFICATION notify, void 
 {
     struct adv_watcher *impl = ctx;
     const struct winebth_le_advertisement *adv;
+    BOOL started;
 
     TRACE( "(%p, %p, %d, %p, %lu)\n", notify, ctx, action, event_data, size );
 
@@ -1728,15 +1729,14 @@ static DWORD CALLBACK adv_watcher_notify_callback( HCMNOTIFICATION notify, void 
         return ERROR_SUCCESS;
     }
     adv = (const struct winebth_le_advertisement *)event_data->u.DeviceHandle.Data;
+    /* A handler may release the watcher. */
+    if (!addref_unless_zero( &impl->ref )) return ERROR_SUCCESS;
 
     EnterCriticalSection( &impl->cs );
-    if (impl->status != BluetoothLEAdvertisementWatcherStatus_Started)
-    {
-        LeaveCriticalSection( &impl->cs );
-        return ERROR_SUCCESS;
-    }
+    started = impl->status == BluetoothLEAdvertisementWatcherStatus_Started;
     LeaveCriticalSection( &impl->cs );
-    adv_watcher_dispatch_received( impl, adv );
+    if (started) adv_watcher_dispatch_received( impl, adv );
+    IBluetoothLEAdvertisementWatcher_Release( &impl->IBluetoothLEAdvertisementWatcher_iface );
     return ERROR_SUCCESS;
 }
 

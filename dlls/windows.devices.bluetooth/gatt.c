@@ -2843,9 +2843,12 @@ static DWORD CALLBACK gatt_characteristic_notify_callback( HCMNOTIFICATION notif
     if (event_data->u.DeviceHandle.DataSize < offsetof( struct winebth_gatt_value_changed, data[changed->size] ))
         return ERROR_SUCCESS;
     if (changed->handle != impl->chrc.AttributeHandle) return ERROR_SUCCESS;
+    /* A handler may release the characteristic. */
+    if (!addref_unless_zero( &impl->ref )) return ERROR_SUCCESS;
 
     TRACE( "characteristic %p handle %#x size %lu\n", impl, changed->handle, changed->size );
     gatt_characteristic_dispatch_value_changed( impl, changed->data, changed->size );
+    IGattCharacteristic_Release( &impl->IGattCharacteristic_iface );
     return ERROR_SUCCESS;
 }
 

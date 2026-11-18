@@ -104,6 +104,18 @@ void event_handlers_free( struct event_handlers *handlers );
 HRESULT event_handlers_add( struct event_handlers *handlers, IUnknown *handler, EventRegistrationToken *token );
 HRESULT event_handlers_remove( struct event_handlers *handlers, EventRegistrationToken token );
 UINT32 event_handlers_snapshot( struct event_handlers *handlers, IUnknown ***out );
+
+/* Take a reference on an object that another thread may be destroying. */
+static inline BOOL addref_unless_zero( LONG *ref )
+{
+    LONG old;
+
+    do
+    {
+        if (!(old = ReadNoFence( ref ))) return FALSE;
+    } while (InterlockedCompareExchange( ref, old + 1, old ) != old);
+    return TRUE;
+}
 HRESULT device_information_create( HSTRING id, HSTRING name, UINT64 addr, IDeviceInformation **out );
 HRESULT device_pairing_create( HSTRING id, HSTRING name, UINT64 addr, IDeviceInformationPairing **out );
 
