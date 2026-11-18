@@ -944,6 +944,7 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
         struct bluetooth_remote_device *device;
         winebluetooth_device_t device_handle;
         winebluetooth_radio_t radio_handle;
+        BTH_ADDR device_addr;
         BOOL found = FALSE;
 
         if (!param)
@@ -957,13 +958,14 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
             break;
         }
 
+        device_addr = RtlUlonglongByteSwap( *param ) >> 16;
         status = STATUS_NOT_FOUND;
         EnterCriticalSection( &device_list_cs );
         LIST_FOR_EACH_ENTRY( device, &ext->remote_devices, struct bluetooth_remote_device, entry )
         {
             EnterCriticalSection( &device->props_cs );
             found = device->props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_ADDRESS &&
-                    device->props.address.ullLong == *param && device->props.paired;
+                    device->props.address.ullLong == device_addr && device->props.paired;
             LeaveCriticalSection( &device->props_cs );
 
             if (found)
