@@ -1027,6 +1027,7 @@ void WINAPI DevCloseObjectQuery( HDEVQUERY query )
 {
     struct device_query_context *ctx = (struct device_query_context *)query;
     BOOL async = ctx->flags & DevQueryFlagAsyncClose;
+    HCMNOTIFICATION notify;
     DEV_QUERY_STATE old;
 
     TRACE( "(%p)\n", query );
@@ -1037,28 +1038,27 @@ void WINAPI DevCloseObjectQuery( HDEVQUERY query )
     EnterCriticalSection( &ctx->cs );
     old = ctx->state;
     ctx->state = DevQueryStateClosed;
+    notify = ctx->notify;
+    ctx->notify = NULL;
+    LeaveCriticalSection( &ctx->cs );
 
-    if (ctx->notify)
+    if (notify)
     {
-        CM_Unregister_Notification( ctx->notify );
+        /* The callback takes ctx->cs, so this cannot be done while holding it. */
+        CM_Unregister_Notification( notify );
         device_query_context_release( ctx ); /* Reference held by CM_Register_Notification. */
     }
     if (async && old == DevQueryStateEnumCompleted)
     {
         /* No asynchronous operation involving this query is active, so we need to notify DevQueryStateClosed. */
-        BOOL success = TrySubmitThreadpoolCallback( device_query_context_notify_closed_async, ctx, NULL );
-        LeaveCriticalSection( &ctx->cs );
-        if (success)
+        if (TrySubmitThreadpoolCallback( device_query_context_notify_closed_async, ctx, NULL ))
             return;
     }
     else if (!async && old == DevQueryStateInitialized)
     {
-        LeaveCriticalSection( &ctx->cs );
         /* Wait for the active async operation to end. */
         WaitForSingleObject( ctx->closed, INFINITE );
     }
-    else
-        LeaveCriticalSection( &ctx->cs );
 
     device_query_context_release( ctx );
     return;
