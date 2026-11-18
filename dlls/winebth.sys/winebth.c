@@ -708,7 +708,7 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
         LeaveCriticalSection( &device_list_cs );
         if (found)
         {
-            status = winebluetooth_device_disconnect( device_handle );
+            status = winebluetooth_device_disconnect( device_handle, TRUE );
             winebluetooth_device_free( device_handle );
         }
         break;
@@ -2154,7 +2154,8 @@ done:
     if (drop)
     {
         TRACE( "No client holds %p, disconnecting\n", (void *)event.device.handle );
-        winebluetooth_device_disconnect( event.device );
+        /* This is the event loop thread, which would wait for a reply that only it can dispatch. */
+        winebluetooth_device_disconnect( event.device, FALSE );
     }
     winebluetooth_device_free( event.device );
 }
@@ -2917,7 +2918,7 @@ static NTSTATUS WINAPI bluetooth_close( DEVICE_OBJECT *device, IRP *irp )
         if (drop)
         {
             TRACE( "Last client of %p closed, disconnecting\n", (void *)remote->device.handle );
-            winebluetooth_device_disconnect( remote->device );
+            winebluetooth_device_disconnect( remote->device, TRUE );
             winebluetooth_device_free( remote->device );
         }
     }

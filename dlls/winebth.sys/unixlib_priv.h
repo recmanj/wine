@@ -58,7 +58,7 @@ extern NTSTATUS bluez_auth_agent_stop( void *connection, void *ctx );
 extern NTSTATUS bluez_auth_agent_send_response( void *auth_agent, struct unix_name *device,
                                                 BLUETOOTH_AUTHENTICATION_METHOD method, UINT32 numeric_or_passkey,
                                                 BOOL negative, BOOL *authenticated );
-extern NTSTATUS bluez_device_disconnect( void *connection, const char *device_path );
+extern NTSTATUS bluez_device_disconnect( void *connection, const char *device_path, BOOL wait );
 extern NTSTATUS bluez_device_start_pairing( void *dbus_connection, void *watcher_ctx, struct unix_name *device, IRP *irp );
 extern NTSTATUS bluez_device_connect( void *dbus_connection, void *watcher_ctx, struct unix_name *device, IRP *irp );
 extern NTSTATUS bluez_gatt_characteristic_write( void *dbus_connection, void *watcher_ctx, struct unix_name *chrc, IRP *irp,

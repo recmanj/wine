@@ -250,7 +250,7 @@ static NTSTATUS bluetooth_device_disconnect( void *args )
     struct bluetooth_device_disconnect_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
-    return bluez_device_disconnect( dbus_connection, params->device->str );
+    return bluez_device_disconnect( dbus_connection, params->device->str, params->wait );
 }
 
 static NTSTATUS bluetooth_device_start_pairing( void *args )

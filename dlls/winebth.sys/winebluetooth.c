@@ -136,12 +136,13 @@ void winebluetooth_device_dup( winebluetooth_device_t device )
     UNIX_BLUETOOTH_CALL( bluetooth_device_dup, &args );
 }
 
-NTSTATUS winebluetooth_device_disconnect( winebluetooth_device_t device )
+NTSTATUS winebluetooth_device_disconnect( winebluetooth_device_t device, BOOL wait )
 {
     struct bluetooth_device_disconnect_params args = {0};
-    TRACE( "(%p)\n", (void *)device.handle );
+    TRACE( "(%p, %d)\n", (void *)device.handle, wait );
 
     args.device = device.handle;
+    args.wait = wait;
     return UNIX_BLUETOOTH_CALL( bluetooth_device_disconnect, &args );
 }
 

@@ -1978,17 +1978,26 @@ done:
     return ret;
 }
 
-NTSTATUS bluez_device_disconnect( void *connection, const char *device_path )
+/* The reply is dispatched by the event loop, whose thread must not wait for it. */
+NTSTATUS bluez_device_disconnect( void *connection, const char *device_path, BOOL wait )
 {
     DBusMessage *request, *reply = NULL;
     NTSTATUS status;
     DBusError error;
 
-    TRACE( "(%p, %s)\n", connection, debugstr_a( device_path ) );
+    TRACE( "(%p, %s, %d)\n", connection, debugstr_a( device_path ), wait );
 
     request = p_dbus_message_new_method_call( BLUEZ_DEST, device_path, BLUEZ_INTERFACE_DEVICE, "Disconnect" );
     if (!request)
         return STATUS_NO_MEMORY;
+    if (!wait)
+    {
+        dbus_bool_t sent;
+
+        sent = p_dbus_connection_send( connection, request, NULL );
+        p_dbus_message_unref( request );
+        return sent ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+    }
 
     p_dbus_error_init( &error );
     status = bluez_dbus_send_and_wait_for_reply( connection, request, &reply, &error );
@@ -3210,7 +3219,7 @@ NTSTATUS bluez_auth_agent_send_response( void *auth_agent, struct unix_name *dev
 {
     return STATUS_NOT_SUPPORTED;
 }
-NTSTATUS bluez_device_disconnect( void *connection, const char *device_path )
+NTSTATUS bluez_device_disconnect( void *connection, const char *device_path, BOOL wait )
 {
     return STATUS_NOT_SUPPORTED;
 }

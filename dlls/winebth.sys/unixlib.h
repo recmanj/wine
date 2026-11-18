@@ -93,6 +93,7 @@ struct bluetooth_gatt_characteristic_value_free_params
 struct bluetooth_device_disconnect_params
 {
     unix_name_t device;
+    BOOL wait;
 };
 
 struct bluetooth_adapter_get_unique_name_params
