@@ -223,6 +223,36 @@ static struct bluetooth_gatt_characteristic *find_gatt_characteristic( struct li
     return NULL;
 }
 
+/* Stands for a request in a call to BlueZ, in place of the IRP. Removing the device completes the request, and its
+ * memory can be used for another one by the time the reply arrives, so the IRP's address does not identify it. */
+struct bluez_request
+{
+    IRP *irp;
+};
+
+static struct bluez_request *bluez_request_create( IRP *irp )
+{
+    struct bluez_request *request;
+
+    if (!(request = malloc( sizeof( *request ) ))) return NULL;
+    request->irp = irp;
+    irp->Tail.Overlay.DriverContext[0] = request;
+    return request;
+}
+
+/* Whether a request waiting for a reply from BlueZ is still pending on this list. */
+static BOOL irp_list_contains( const LIST_ENTRY *irp_list, const struct bluez_request *request )
+{
+    const LIST_ENTRY *entry;
+
+    for (entry = irp_list->Flink; entry != irp_list; entry = entry->Flink)
+    {
+        const IRP *irp = CONTAINING_RECORD( entry, IRP, Tail.Overlay.ListEntry );
+        if (irp == request->irp && irp->Tail.Overlay.DriverContext[0] == request) return TRUE;
+    }
+    return FALSE;
+}
+
 static NTSTATUS bluetooth_gatt_service_get_characteristics( struct bluetooth_gatt_service *service, IRP *irp )
 {
     const SIZE_T min_size = offsetof( struct winebth_le_device_get_gatt_characteristics_params, characteristics[0] );
@@ -308,12 +338,16 @@ static NTSTATUS bluetooth_gatt_service_dispatch( DEVICE_OBJECT *device, struct b
         }
         if (params->from_device || !chrc->value)
         {
-            status = winebluetooth_gatt_characteristic_read_async( chrc->characteristic, irp );
+            struct bluez_request *request = bluez_request_create( irp );
+
+            status = request ? winebluetooth_gatt_characteristic_read_async( chrc->characteristic, (IRP *)request )
+                             : STATUS_NO_MEMORY;
             if (status == STATUS_PENDING)
             {
                 IoMarkIrpPending( irp );
                 InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
             }
+            else free( request );
         }
         else
         {
@@ -355,13 +389,18 @@ static NTSTATUS bluetooth_gatt_service_dispatch( DEVICE_OBJECT *device, struct b
             status = STATUS_PRIVILEGE_NOT_HELD;
         else
         {
-            status = winebluetooth_gatt_characteristic_write_async( chrc->characteristic, irp, params->buf, params->size,
-                                                                    !!params->without_response );
+            struct bluez_request *request = bluez_request_create( irp );
+
+            status = request ? winebluetooth_gatt_characteristic_write_async( chrc->characteristic, (IRP *)request,
+                                                                              params->buf, params->size,
+                                                                              !!params->without_response )
+                             : STATUS_NO_MEMORY;
             if (status == STATUS_PENDING)
             {
                 IoMarkIrpPending( irp );
                 InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
             }
+            else free( request );
         }
         LeaveCriticalSection( &ext->chars_cs );
         break;
@@ -388,13 +427,18 @@ static NTSTATUS bluetooth_gatt_service_dispatch( DEVICE_OBJECT *device, struct b
             status = STATUS_SUCCESS;
         else
         {
-            status = winebluetooth_gatt_characteristic_set_notify_async( chrc->characteristic, irp, !!params->enable );
+            struct bluez_request *request = bluez_request_create( irp );
+
+            status = request ? winebluetooth_gatt_characteristic_set_notify_async( chrc->characteristic, (IRP *)request,
+                                                                                   !!params->enable )
+                             : STATUS_NO_MEMORY;
             if (status == STATUS_PENDING)
             {
                 chrc->notifying = !!params->enable;
                 IoMarkIrpPending( irp );
                 InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
             }
+            else free( request );
         }
         LeaveCriticalSection( &ext->chars_cs );
         break;
@@ -876,12 +920,15 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
             LeaveCriticalSection( &device->props_cs );
             if (matches)
             {
-                status = winebluetooth_device_start_pairing( device->device, irp );
+                struct bluez_request *request = bluez_request_create( irp );
+
+                status = request ? winebluetooth_device_start_pairing( device->device, (IRP *)request ) : STATUS_NO_MEMORY;
                 if (status == STATUS_PENDING)
                 {
                     IoMarkIrpPending( irp );
                     InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
                 }
+                else free( request );
                 break;
             }
         }
@@ -2028,15 +2075,61 @@ done:
     winebluetooth_gatt_characteristic_free( event.characteristic );
 }
 
+/* Find the GATT service that still has a request pending. A service that is removed completes its requests, and
+ * the reply from BlueZ may only arrive after that, so the IRP must not be touched before it is found here.
+ * Returns with device_list_cs, the device's props_cs and the service's chars_cs held. */
+static struct bluetooth_gatt_service *gatt_service_lock_pending_request( const struct bluez_request *request )
+{
+    struct bluetooth_radio *radio;
+
+    EnterCriticalSection( &device_list_cs );
+    LIST_FOR_EACH_ENTRY( radio, &device_list, struct bluetooth_radio, entry )
+    {
+        struct bluetooth_remote_device *device;
+
+        LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
+        {
+            struct bluetooth_gatt_service *svc;
+
+            EnterCriticalSection( &device->props_cs );
+            LIST_FOR_EACH_ENTRY( svc, &device->gatt_services, struct bluetooth_gatt_service, entry )
+            {
+                EnterCriticalSection( &svc->chars_cs );
+                if (irp_list_contains( &svc->irp_list, request )) return svc;
+                LeaveCriticalSection( &svc->chars_cs );
+            }
+            LeaveCriticalSection( &device->props_cs );
+        }
+    }
+    LeaveCriticalSection( &device_list_cs );
+    return NULL;
+}
+
+static void gatt_service_unlock( struct bluetooth_gatt_service *svc )
+{
+    LeaveCriticalSection( &svc->chars_cs );
+    LeaveCriticalSection( &svc->remote_device->props_cs );
+    LeaveCriticalSection( &device_list_cs );
+}
+
 static void bluetooth_gatt_characteristic_value_read_complete_irp(
     struct winebluetooth_watcher_event_gatt_characteristic_value_read read )
 {
-    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation( read.irp );
-    struct bluetooth_pdo_ext *ext = stack->DeviceObject->DeviceExtension;
+    struct bluez_request *request = (struct bluez_request *)read.irp;
+    struct bluetooth_gatt_service *svc;
+    IO_STACK_LOCATION *stack;
     NTSTATUS status;
 
-    assert( ext->type == BLUETOOTH_PDO_EXT_GATT_SERVICE );
+    if (!(svc = gatt_service_lock_pending_request( request )))
+    {
+        if (!read.result) winebluetooth_gatt_characteristic_value_free( &read.value );
+        free( request );
+        return;
+    }
 
+    read.irp = request->irp;
+    free( request );
+    stack = IoGetCurrentIrpStackLocation( read.irp );
     if (!(status = read.result))
     {
         ULONG needed = offsetof( struct winebth_gatt_service_read_characterisitic_value_params, buf[read.value.size] );
@@ -2057,28 +2150,32 @@ static void bluetooth_gatt_characteristic_value_read_complete_irp(
         }
     }
 
-    EnterCriticalSection( &ext->gatt_service.chars_cs );
     complete_irp( read.irp, status );
-    LeaveCriticalSection( &ext->gatt_service.chars_cs );
+    gatt_service_unlock( svc );
 }
 
 static void bluetooth_gatt_operation_complete_irp( struct winebluetooth_watcher_event_gatt_operation_finished finished )
 {
-    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation( finished.irp );
-    struct bluetooth_pdo_ext *ext = stack->DeviceObject->DeviceExtension;
+    struct bluez_request *request = (struct bluez_request *)finished.irp;
+    struct bluetooth_gatt_service *svc;
+    IO_STACK_LOCATION *stack;
 
-    assert( ext->type == BLUETOOTH_PDO_EXT_GATT_SERVICE );
-    EnterCriticalSection( &ext->gatt_service.chars_cs );
+    svc = gatt_service_lock_pending_request( request );
+    finished.irp = request->irp;
+    free( request );
+    if (!svc) return;
+
+    stack = IoGetCurrentIrpStackLocation( finished.irp );
     /* A notify session is recorded when it is requested, so a refusal has to take it back. */
     if (finished.result && stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_WINEBTH_GATT_SERVICE_SET_CHARACTERISTIC_NOTIFY)
     {
         const struct winebth_gatt_service_set_characteristic_notify_params *params = finished.irp->AssociatedIrp.SystemBuffer;
-        struct bluetooth_gatt_characteristic *chrc = find_gatt_characteristic( &ext->gatt_service.characteristics,
+        struct bluetooth_gatt_characteristic *chrc = find_gatt_characteristic( &svc->characteristics,
                                                                              &params->uuid, params->handle );
         if (chrc) chrc->notifying = !params->enable;
     }
     complete_irp( finished.irp, finished.result );
-    LeaveCriticalSection( &ext->gatt_service.chars_cs );
+    gatt_service_unlock( svc );
 }
 
 /* Whether the link has no owner left: every client closed and no Connect is in flight. Caller must hold props_cs. */
@@ -2160,6 +2257,23 @@ done:
     winebluetooth_device_free( event.device );
 }
 
+/* A radio that is removed completes its requests, which the reply from BlueZ may come after. */
+static void bluetooth_radio_complete_pairing_irp( struct winebluetooth_watcher_event_pairing_finished finished )
+{
+    struct bluez_request *request = (struct bluez_request *)finished.irp;
+    struct bluetooth_radio *radio;
+
+    EnterCriticalSection( &device_list_cs );
+    LIST_FOR_EACH_ENTRY( radio, &device_list, struct bluetooth_radio, entry )
+    {
+        if (!irp_list_contains( &radio->irp_list, request )) continue;
+        complete_irp( request->irp, finished.result );
+        break;
+    }
+    LeaveCriticalSection( &device_list_cs );
+    free( request );
+}
+
 static DWORD CALLBACK bluetooth_event_loop_thread_proc( void *arg )
 {
     NTSTATUS status;
@@ -2199,10 +2313,7 @@ static DWORD CALLBACK bluetooth_event_loop_thread_proc( void *arg )
                         bluetooth_radio_update_device_props( event->event_data.device_props_changed);
                         break;
                     case BLUETOOTH_WATCHER_EVENT_TYPE_PAIRING_FINISHED:
-                        EnterCriticalSection( &device_list_cs );
-                        complete_irp( event->event_data.pairing_finished.irp,
-                                      event->event_data.pairing_finished.result );
-                        LeaveCriticalSection( &device_list_cs );
+                        bluetooth_radio_complete_pairing_irp( event->event_data.pairing_finished );
                         break;
                     case BLUETOOTH_WATCHER_EVENT_TYPE_CONNECT_FINISHED:
                         bluetooth_device_connect_finished( event->event_data.connect_finished );
@@ -2539,7 +2650,9 @@ static NTSTATUS WINAPI gatt_service_pdo_pnp( DEVICE_OBJECT *device_obj, struct b
         struct bluetooth_gatt_characteristic *chrc, *next;
 
         assert( ext->removed );
+        EnterCriticalSection( &ext->chars_cs );
         remove_pending_irps( &ext->irp_list );
+        LeaveCriticalSection( &ext->chars_cs );
         if (ext->service_symlink_name.Buffer)
         {
             IoSetDeviceInterfaceState( &ext->service_symlink_name, FALSE );
@@ -2558,7 +2671,9 @@ static NTSTATUS WINAPI gatt_service_pdo_pnp( DEVICE_OBJECT *device_obj, struct b
     }
     case IRP_MN_SURPRISE_REMOVAL:
     {
+        EnterCriticalSection( &ext->chars_cs );
         remove_pending_irps( &ext->irp_list );
+        LeaveCriticalSection( &ext->chars_cs );
         EnterCriticalSection( &ext->remote_device->props_cs );
         if (!ext->removed)
         {
