@@ -32,6 +32,9 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL( bluetooth );
 
+/* The longest attribute value ATT allows. */
+#define GATT_MAX_VALUE_SIZE 512
+
 /* --- Shared helpers --- */
 
 void event_handlers_init( struct event_handlers *handlers )
@@ -2687,6 +2690,7 @@ static GattCommunicationStatus gatt_characteristic_perform_write( struct gatt_ch
         UINT32 len;
 
         if (FAILED(buffer_get_data( request->value, &data, &len ))) return GattCommunicationStatus_Unreachable;
+        if (len > GATT_MAX_VALUE_SIZE) return GattCommunicationStatus_ProtocolError;
         size = offsetof( struct winebth_gatt_service_write_characteristic_value_params, buf[len] );
         if (!(params = calloc( 1, max( size, sizeof( *params ) ) ))) return GattCommunicationStatus_Unreachable;
         params->uuid = impl->chrc.CharacteristicUuid;
