@@ -200,9 +200,11 @@ HRESULT WINAPI BluetoothGATTGetCharacteristicValue( HANDLE device, BTH_LE_GATT_C
 
     ret = err ? HRESULT_FROM_WIN32( ERROR_MORE_DATA ) : S_OK;
     *actual = max( offsetof( BTH_LE_GATT_CHARACTERISTIC_VALUE, Data[params->size] ), sizeof( *val ) );
-    if (val && !err)
+    if (size && !err)
     {
-        if (size >= params->size)
+        /* The value may have grown since the caller asked for its size. */
+        if (size - offsetof( BTH_LE_GATT_CHARACTERISTIC_VALUE, Data ) >= params->size &&
+            bytes >= offsetof( struct winebth_gatt_service_read_characterisitic_value_params, buf[params->size] ))
         {
             val->DataSize = params->size;
             memcpy( val->Data, params->buf, params->size );
