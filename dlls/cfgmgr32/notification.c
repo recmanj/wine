@@ -19,6 +19,7 @@
 
 #include "cfgmgr32_private.h"
 #include "wine/exception.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(setupapi);
 
@@ -47,14 +48,61 @@ static const char *debugstr_CM_NOTIFY_FILTER( const CM_NOTIFY_FILTER *filter )
 struct cm_notify_context
 {
     DWORD magic;
+    struct list entry;
+    ULONG_PTR id;
     HDEVNOTIFY notify;
     void *user_data;
     PCM_NOTIFY_CALLBACK callback;
+    DWORD callback_thread; /* thread running the callback, if any */
+    BOOL unregistered;
 };
+
+static CRITICAL_SECTION notify_cs;
+static CRITICAL_SECTION_DEBUG notify_cs_debug =
+{
+    0, 0, &notify_cs,
+    { &notify_cs_debug.ProcessLocksList, &notify_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": notify_cs") }
+};
+static CRITICAL_SECTION notify_cs = { &notify_cs_debug, -1, 0, 0, 0, 0 };
+static CONDITION_VARIABLE notify_cv = CONDITION_VARIABLE_INIT;
+static struct list notify_contexts = LIST_INIT( notify_contexts );
+static ULONG_PTR next_notify_id;
+
+/* sechost invokes callbacks from a snapshot of the registrations, so one may still arrive after
+ * I_ScUnregisterDeviceNotification. It is given the context id, which is never reused, and not the pointer. */
+static struct cm_notify_context *notify_context_enter( HANDLE handle )
+{
+    struct cm_notify_context *ctx, *found = NULL;
+
+    EnterCriticalSection( &notify_cs );
+    LIST_FOR_EACH_ENTRY( ctx, &notify_contexts, struct cm_notify_context, entry )
+    {
+        if (ctx->id != (ULONG_PTR)handle) continue;
+        ctx->callback_thread = GetCurrentThreadId();
+        found = ctx;
+        break;
+    }
+    LeaveCriticalSection( &notify_cs );
+    return found;
+}
+
+static void notify_context_leave( struct cm_notify_context *ctx )
+{
+    BOOL unregistered;
+
+    EnterCriticalSection( &notify_cs );
+    ctx->callback_thread = 0;
+    unregistered = ctx->unregistered;
+    LeaveCriticalSection( &notify_cs );
+    /* The context was unregistered from its own callback, which could not wait for itself. */
+    if (unregistered) free( ctx );
+    else WakeAllConditionVariable( &notify_cv );
+}
 
 CALLBACK DWORD devnotify_callback( HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header )
 {
-    struct cm_notify_context *ctx = handle;
+    struct cm_notify_context *ctx;
     CM_NOTIFY_EVENT_DATA *event_data;
     CM_NOTIFY_ACTION action;
     DWORD size, ret;
@@ -113,7 +161,12 @@ CALLBACK DWORD devnotify_callback( HANDLE handle, DWORD flags, DEV_BROADCAST_HDR
         return 0;
     }
 
-    ret = ctx->callback( ctx, ctx->user_data, action, event_data, size );
+    if ((ctx = notify_context_enter( handle )))
+    {
+        ret = ctx->callback( ctx, ctx->user_data, action, event_data, size );
+        notify_context_leave( ctx );
+    }
+    else ret = 0;
     free( event_data );
     return ret;
 }
@@ -162,7 +215,10 @@ static CONFIGRET create_notify_context( const CM_NOTIFY_FILTER *filter, HCMNOTIF
     ctx->magic = CM_NOTIFY_CONTEXT_MAGIC;
     ctx->user_data = user_data;
     ctx->callback = callback;
-    if (!(ctx->notify = I_ScRegisterDeviceNotification( ctx, &notify_filter.header, devnotify_callback )))
+    EnterCriticalSection( &notify_cs );
+    ctx->id = ++next_notify_id;
+    LeaveCriticalSection( &notify_cs );
+    if (!(ctx->notify = I_ScRegisterDeviceNotification( (HANDLE)ctx->id, &notify_filter.header, devnotify_callback )))
     {
         free( ctx );
         switch (GetLastError())
@@ -172,7 +228,11 @@ static CONFIGRET create_notify_context( const CM_NOTIFY_FILTER *filter, HCMNOTIF
         default: return CR_FAILURE;
         }
     }
+    /* The handle has to be returned before the first callback can use it. */
     *notify_handle = ctx;
+    EnterCriticalSection( &notify_cs );
+    list_add_tail( &notify_contexts, &ctx->entry );
+    LeaveCriticalSection( &notify_cs );
     return CR_SUCCESS;
 }
 
@@ -197,18 +257,17 @@ CONFIGRET WINAPI CM_Unregister_Notification( HCMNOTIFICATION notify )
 {
     struct cm_notify_context *ctx = notify;
     CONFIGRET ret = CR_SUCCESS;
+    BOOL in_callback;
 
     TRACE( "(%p)\n", notify );
 
     if (!notify) return CR_INVALID_DATA;
 
+    EnterCriticalSection( &notify_cs );
     __TRY
     {
         if (ctx->magic == CM_NOTIFY_CONTEXT_MAGIC)
-        {
-            I_ScUnregisterDeviceNotification( ctx->notify );
-            free( ctx );
-        }
+            ctx->magic = 0;
         else
             ret = CR_INVALID_DATA;
     }
@@ -217,6 +276,21 @@ CONFIGRET WINAPI CM_Unregister_Notification( HCMNOTIFICATION notify )
         ret = CR_FAILURE;
     }
     __ENDTRY
+    if (ret)
+    {
+        LeaveCriticalSection( &notify_cs );
+        return ret;
+    }
 
-    return ret;
+    /* No callback starts once the context is off the list. Wait for one that is running, as Windows does. */
+    list_remove( &ctx->entry );
+    if ((in_callback = ctx->callback_thread == GetCurrentThreadId()))
+        ctx->unregistered = TRUE;
+    else
+        while (ctx->callback_thread) SleepConditionVariableCS( &notify_cv, &notify_cs, INFINITE );
+    LeaveCriticalSection( &notify_cs );
+
+    I_ScUnregisterDeviceNotification( ctx->notify );
+    if (!in_callback) free( ctx );
+    return CR_SUCCESS;
 }
