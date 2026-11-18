@@ -638,7 +638,7 @@ static BOOL CALLBACK pairing_auth_callback( void *ctx, BLUETOOTH_AUTHENTICATION_
     struct pairing_request_args *args = NULL;
     IDeviceInformation *info = NULL;
     DevicePairingKinds kind;
-    IUnknown **handlers;
+    IUnknown **handlers = NULL;
     UINT32 i, count;
     WCHAR pin[7];
     DWORD ret;
