@@ -832,6 +832,12 @@ static CALLBACK DWORD bluetooth_auth_event_callback( HCMNOTIFICATION notify, voi
         }
 
         AcquireSRWLockExclusive( &bluetooth_auth_lock );
+        /* A registration that is being replaced is unregistered outside the lock and can still get the event. */
+        if (notify != bluetooth_auth_event_notify)
+        {
+            ReleaseSRWLockExclusive( &bluetooth_auth_lock );
+            break;
+        }
         LIST_FOR_EACH_ENTRY( listener, &bluetooth_auth_listeners, struct bluetooth_auth_listener, entry )
         {
             struct auth_callback_data *data;
@@ -966,6 +972,7 @@ DWORD WINAPI BluetoothRegisterForAuthenticationEx( const BLUETOOTH_DEVICE_INFO *
 BOOL WINAPI BluetoothUnregisterAuthentication( HBLUETOOTH_AUTHENTICATION_REGISTRATION handle )
 {
     struct bluetooth_auth_listener *listener = handle;
+    HCMNOTIFICATION notify = NULL;
     DWORD ret = ERROR_SUCCESS;
 
     TRACE( "(%s)\n", debugstr_bluetooth_auth_listener( handle ) );
@@ -980,11 +987,14 @@ BOOL WINAPI BluetoothUnregisterAuthentication( HBLUETOOTH_AUTHENTICATION_REGISTR
     list_remove( &listener->entry );
     if (list_empty( &bluetooth_auth_listeners ))
     {
-        ret = CM_Unregister_Notification( bluetooth_auth_event_notify );
-        if (ret)
-            ERR( "CM_Unregister_Notification failed: %#lx\n", ret );
+        notify = bluetooth_auth_event_notify;
+        bluetooth_auth_event_notify = NULL;
     }
     ReleaseSRWLockExclusive( &bluetooth_auth_lock );
+
+    /* The callback takes bluetooth_auth_lock, so this cannot be done while holding it. */
+    if (notify && (ret = CM_Unregister_Notification( notify )))
+        ERR( "CM_Unregister_Notification failed: %#lx\n", ret );
 
     SetLastError( ret );
     return !ret;
